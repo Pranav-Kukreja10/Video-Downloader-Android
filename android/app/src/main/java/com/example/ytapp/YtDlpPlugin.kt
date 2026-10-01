@@ -40,20 +40,22 @@ class YtDlpPlugin : Plugin() {
 
     @PluginMethod
     fun download(call: PluginCall) {
-        val url = call.getString("url")
-        if (url.isNullOrBlank() || !url.trim().matches(Regex("^https?://.+"))) {
+        val rawUrl = call.getString("url")
+        if (rawUrl.isNullOrBlank() || !rawUrl.trim().matches(Regex("^https?://.+"))) {
             return call.reject("Enter a link that starts with http:// or https://")
         }
         if (!initialised) return call.reject("The download engine is still starting. Try again in a moment.")
 
-        val format = call.getString("format") ?: "audio"
-        val quality = call.getInt("quality") ?: 192
+        val url = cleanUrl(rawUrl)
+        val format = call.getString("format") ?: "video_audio"
+        val quality = call.getInt("quality") ?: 1080
         val id = call.getString("id") ?: System.currentTimeMillis().toString()
 
         val base = context.getExternalFilesDir(null) ?: context.cacheDir
         val outDir = File(base, "dl/$id").apply { mkdirs() }
 
         DownloadService.start(context)
+        notifyListeners("progress", JSObject().put("id", id).put("progress", 0))
 
         thread {
             var lastError = "Unknown error"
@@ -66,7 +68,7 @@ class YtDlpPlugin : Plugin() {
                 for ((safe, cookies) in attempts) {
                     try {
                         outDir.listFiles()?.forEach { it.deleteRecursively() }
-                        val req = buildRequest(url.trim(), format, quality, outDir, safe, cookies)
+                        val req = buildRequest(url, format, quality, outDir, safe, cookies)
                         var last = -1
                         YoutubeDL.getInstance().execute(req, id) { progress, _, _ ->
                             val p = progress.toInt().coerceIn(0, 99)
@@ -103,6 +105,20 @@ class YtDlpPlugin : Plugin() {
         }
     }
 
+    private fun cleanUrl(raw: String): String {
+        var u = raw.trim()
+        if (u.contains("instagram.com")) {
+            u = u.replace("/share/reel/", "/reel/")
+                .replace("/share/p/", "/p/")
+            val regex = Regex("""(https?://(?:www\.)?instagram\.com/(?:reel|reels|p|tv)/[A-Za-z0-9_-]+)""")
+            val match = regex.find(u)
+            if (match != null) {
+                u = match.groupValues[1] + "/"
+            }
+        }
+        return u
+    }
+
     private fun buildRequest(
         url: String, format: String, q: Int, outDir: File, safe: Boolean, cookies: Boolean
     ): YoutubeDLRequest {
@@ -110,11 +126,18 @@ class YtDlpPlugin : Plugin() {
         req.addOption("--no-playlist")
         req.addOption("--windows-filenames")
         req.addOption("--no-mtime")
-        req.addOption("--retries", "10")
-        req.addOption("--fragment-retries", "10")
-        req.addOption("--extractor-retries", "3")
-        req.addOption("--socket-timeout", "20")
+        req.addOption("--retries", "3")
+        req.addOption("--fragment-retries", "3")
+        req.addOption("--extractor-retries", "2")
+        req.addOption("--socket-timeout", "10")
+        req.addOption("-N", "4") // Multi-threaded 4 concurrent fragment streams for fast download
         req.addOption("-o", "${outDir.absolutePath}/%(title).150B.%(ext)s")
+        
+        // Modern browser User-Agent so Instagram and YouTube do not reject requests as bots
+        req.addOption("--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+        if (url.contains("instagram.com")) {
+            req.addOption("--referer", "https://www.instagram.com/")
+        }
         if (cookies) req.addOption("--cookies", cookiesFile().absolutePath)
 
         when (format) {
@@ -131,18 +154,18 @@ class YtDlpPlugin : Plugin() {
             }
             "video" -> {
                 val f = if (safe) {
-                    "b[height<=$q]/b[width<=$q]/b"
+                    "b[height<=$q]/b[width<=$q]/bestvideo/best"
                 } else {
-                    "bv*[height<=$q]/bv*[width<=$q]/b[height<=$q]/bv*/b"
+                    "bv*[height<=$q]/bv*[width<=$q]/b[height<=$q]/b[width<=$q]/bestvideo/best"
                 }
                 req.addOption("-f", f)
                 req.addOption("-S", "res,ext:mp4:m4a")
             }
             else -> {
                 val f = if (safe) {
-                    "b[height<=$q]/b[width<=$q]/b"
+                    "b[height<=$q]/b[width<=$q]/bv*+ba/best"
                 } else {
-                    "bv*[height<=$q]+ba/bv*[width<=$q]+ba/b[height<=$q]/bv*+ba/b"
+                    "bv*[height<=$q]+ba/bv*[width<=$q]+ba/b[height<=$q]/b[width<=$q]/bv*+ba/best"
                 }
                 req.addOption("-f", f)
                 req.addOption("-S", "res,ext:mp4:m4a")
@@ -276,7 +299,9 @@ class YtDlpPlugin : Plugin() {
         val low = msg.lowercase()
         return when {
             "sign in" in low || "not a bot" in low || "confirm your age" in low ->
-                "YouTube wants a sign-in check. Import a cookies.txt from a logged-in browser and try again."
+                "Site requested sign-in check. Import cookies.txt or tap Update Core."
+            "instagram" in low && ("login" in low || "checkpoint" in low || "redirect" in low) ->
+                "Instagram requested login for this reel. Import cookies.txt or tap Update Core."
             "ffmpeg" in low || "ffprobe" in low -> "ffmpeg problem. Reinstall the app."
             "private video" in low -> "This video is private."
             "unavailable" in low || "removed" in low -> "This video is unavailable."

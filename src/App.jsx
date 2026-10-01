@@ -149,23 +149,34 @@ export default function App() {
     setQualityOpen(false);
   };
 
+  const cleanMediaUrl = (input) => {
+    let u = (input || "").trim();
+    if (u.includes("instagram.com")) {
+      u = u.replace("/share/reel/", "/reel/").replace("/share/p/", "/p/");
+      const m = u.match(/(https?:\/\/(?:www\.)?instagram\.com\/(?:reel|reels|p|tv)\/[A-Za-z0-9_-]+)/);
+      if (m) u = m[1] + "/";
+    }
+    return u;
+  };
+
   const handlePaste = async () => {
     try {
       const text = await navigator.clipboard.readText();
-      if (text) setUrl(text.trim());
+      if (text) setUrl(cleanMediaUrl(text));
     } catch {
       // Browser permission prompt or fallback
     }
   };
 
   const startDownload = async () => {
-    if (!url.trim()) return;
+    const targetUrl = cleanMediaUrl(url);
+    if (!targetUrl) return;
     const id = String(Date.now());
     setErrorMessage("");
     setJob({ id, progress: 0 });
 
     try {
-      const r = await YtDlp.download({ id, url: url.trim(), format, quality });
+      const r = await YtDlp.download({ id, url: targetUrl, format, quality });
       
       const finishedItem = {
         id,
@@ -525,17 +536,21 @@ export default function App() {
                       <line x1="16.24" y1="7.76" x2="19.07" y2="4.93" />
                     </svg>
                   </div>
-                  <span className="progress-text">Downloading Media…</span>
+                  <span className="progress-text">
+                    {job.progress === 0 ? "Connecting & Resolving…" : "Downloading Media…"}
+                  </span>
                 </div>
                 <span className="progress-pct">{job.progress}%</span>
               </div>
 
               <div className="progress-track">
-                <div className="progress-fill" style={{ width: `${job.progress}%` }} />
+                <div className="progress-fill" style={{ width: `${Math.max(job.progress, 5)}%` }} />
               </div>
 
               <div className="progress-footer">
-                <span className="progress-sub">Processing lossless stream</span>
+                <span className="progress-sub">
+                  {job.progress === 0 ? "Analyzing stream link" : `${job.progress}% completed`}
+                </span>
                 <button className="cancel-btn" onClick={cancelDownload} type="button">
                   Cancel
                 </button>
