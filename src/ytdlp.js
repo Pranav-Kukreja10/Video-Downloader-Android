@@ -16,7 +16,12 @@ const stub = {
   },
   async cancel() {},
   async update() { return { status: "browser-demo" }; },
+  async getInfo({ url }) {
+    await new Promise((r) => setTimeout(r, 600));
+    return { title: "Demo Video", thumbnail: "", duration: "03:14", uploader: "Demo Uploader" };
+  },
   async getVersion() { return { version: "browser-demo" }; },
+  async getInitialShareUrl() { return { url: "" }; },
   async saveCookies() {},
   async clearCookies() {},
   async hasCookies() { return { value: false }; },

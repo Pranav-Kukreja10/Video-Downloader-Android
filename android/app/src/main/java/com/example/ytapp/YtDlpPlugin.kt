@@ -2,6 +2,7 @@ package com.example.ytapp
 
 import android.app.Application
 import android.content.ContentValues
+import android.content.Intent
 import android.net.Uri
 import android.os.Environment
 import android.provider.MediaStore
@@ -19,12 +20,38 @@ import kotlin.concurrent.thread
 @CapacitorPlugin(name = "YtDlp")
 class YtDlpPlugin : Plugin() {
 
+    companion object {
+        @Volatile
+        var instance: YtDlpPlugin? = null
+        @Volatile
+        var initialSharedUrl: String? = null
+
+        fun handleIncomingIntent(intent: Intent?) {
+            if (intent == null) return
+            if (intent.action == Intent.ACTION_SEND && intent.type?.startsWith("text/") == true) {
+                val text = intent.getStringExtra(Intent.EXTRA_TEXT)
+                if (!text.isNullOrBlank()) {
+                    initialSharedUrl = text
+                    instance?.let { plugin ->
+                        plugin.notifyListeners("shared_url", JSObject().put("url", text), true)
+                    }
+                }
+            }
+        }
+    }
+
     @Volatile private var initialised = false
 
     override fun load() {
+        instance = this
         // First launch unpacks Python + ffmpeg, so keep it off the main thread.
         thread {
             try {
+                // Cleanup orphaned downloads from previous abrupt exits
+                val base = context.getExternalFilesDir(null) ?: context.cacheDir
+                val dlFolder = File(base, "dl")
+                if (dlFolder.exists()) dlFolder.deleteRecursively()
+
                 val app = context.applicationContext as Application
                 YoutubeDL.getInstance().init(app)
                 FFmpeg.getInstance().init(app)
@@ -37,6 +64,77 @@ class YtDlpPlugin : Plugin() {
     }
 
     // ---------------------------------------------------------------- download
+    
+    private var activeDownloads = 0
+    private val activeDownloadsLock = Any()
+
+    private fun incrementDownloads() {
+        synchronized(activeDownloadsLock) {
+            if (activeDownloads == 0) DownloadService.start(context)
+            activeDownloads++
+        }
+    }
+
+    private fun decrementDownloads() {
+        synchronized(activeDownloadsLock) {
+            activeDownloads--
+            if (activeDownloads <= 0) {
+                activeDownloads = 0
+                DownloadService.stop(context)
+            }
+        }
+    }
+
+    @PluginMethod
+    fun getInfo(call: PluginCall) {
+        val rawUrl = call.getString("url")
+        if (rawUrl.isNullOrBlank() || !rawUrl.trim().matches(Regex("^https?://.+"))) {
+            return call.reject("Enter a valid link")
+        }
+        val url = cleanUrl(rawUrl)
+        
+        thread {
+            try {
+                val req = YoutubeDLRequest(url)
+                req.addOption("--dump-json")
+                req.addOption("--no-playlist")
+                req.addOption("--skip-download")
+                req.addOption("--socket-timeout", "10")
+                req.addOption("--force-ipv4")
+                req.addOption("--no-warnings")
+                if (cookiesFile().exists()) req.addOption("--cookies", cookiesFile().absolutePath)
+                
+                val res = YoutubeDL.getInstance().execute(req)
+                val json = org.json.JSONObject(res.out ?: "{}")
+                
+                val title = json.optString("title", "Unknown Stream")
+                val duration = json.optLong("duration", 0L)
+                val uploader = json.optString("uploader", json.optString("channel", "Web Stream"))
+                
+                var thumb = json.optString("thumbnail", "")
+                if (thumb.isEmpty() && json.has("thumbnails")) {
+                    val thumbs = json.optJSONArray("thumbnails")
+                    if (thumbs != null && thumbs.length() > 0) {
+                        thumb = thumbs.getJSONObject(thumbs.length() - 1).optString("url", "")
+                    }
+                }
+                
+                val minutes = duration / 60
+                val seconds = duration % 60
+                val durationStr = if (duration > 0) String.format("%02d:%02d", minutes, seconds) else "Live Stream"
+
+                call.resolve(
+                    JSObject()
+                        .put("title", title)
+                        .put("thumbnail", thumb)
+                        .put("duration", durationStr)
+                        .put("uploader", uploader)
+                )
+            } catch (e: Exception) {
+                call.reject(explain(e.message ?: "Failed to fetch info"))
+            }
+        }
+    }
 
     @PluginMethod
     fun download(call: PluginCall) {
@@ -54,7 +152,7 @@ class YtDlpPlugin : Plugin() {
         val base = context.getExternalFilesDir(null) ?: context.cacheDir
         val outDir = File(base, "dl/$id").apply { mkdirs() }
 
-        DownloadService.start(context)
+        incrementDownloads()
         notifyListeners("progress", JSObject().put("id", id).put("progress", 0))
 
         thread {
@@ -70,12 +168,15 @@ class YtDlpPlugin : Plugin() {
                         outDir.listFiles()?.forEach { it.deleteRecursively() }
                         val req = buildRequest(url, format, quality, outDir, safe, cookies)
                         var last = -1
-                        YoutubeDL.getInstance().execute(req, id) { progress, _, _ ->
+                        YoutubeDL.getInstance().execute(req, id) { progress, _, line ->
                             val p = progress.toInt().coerceIn(0, 99)
                             if (p != last) {
                                 last = p
                                 notifyListeners("progress", JSObject().put("id", id).put("progress", p))
                                 DownloadService.update(context, p)
+                            }
+                            if (line.contains("ERROR:")) {
+                                notifyListeners("realtime_error", JSObject().put("id", id).put("error", line.substringAfter("ERROR:").trim()))
                             }
                         }
                         done = newestMedia(outDir)
@@ -100,21 +201,38 @@ class YtDlpPlugin : Plugin() {
                 call.reject(explain(e.message ?: e.toString()))
             } finally {
                 outDir.deleteRecursively()
-                DownloadService.stop(context)
+                decrementDownloads()
             }
         }
     }
 
     private fun cleanUrl(raw: String): String {
         var u = raw.trim()
+        val urlMatch = Regex("""(https?://[^\s]+)""").find(u)
+        if (urlMatch != null) {
+            u = urlMatch.groupValues[1]
+        }
+
         if (u.contains("instagram.com")) {
             u = u.replace("/share/reel/", "/reel/")
                 .replace("/share/p/", "/p/")
-            val regex = Regex("""(https?://(?:www\.)?instagram\.com/(?:reel|reels|p|tv)/[A-Za-z0-9_-]+)""")
+            val regex = Regex("""(https?://(?:www\.|m\.)?instagram\.com/(?:reel|reels|p|tv)/[A-Za-z0-9_-]+)""")
             val match = regex.find(u)
             if (match != null) {
                 u = match.groupValues[1] + "/"
             }
+        } else if (u.contains("youtu.be/")) {
+            val m = Regex("""(https?://youtu\.be/[A-Za-z0-9_-]+)""").find(u)
+            if (m != null) u = m.groupValues[1]
+        } else if (u.contains("youtube.com/watch")) {
+            val m = Regex("""(https?://(?:www\.|m\.)?youtube\.com/watch\?v=[A-Za-z0-9_-]+)""").find(u)
+            if (m != null) u = m.groupValues[1]
+        } else if (u.contains("youtube.com/shorts/")) {
+            val m = Regex("""(https?://(?:www\.|m\.)?youtube\.com/shorts/[A-Za-z0-9_-]+)""").find(u)
+            if (m != null) u = m.groupValues[1]
+        } else if (u.contains("twitter.com/") || u.contains("x.com/")) {
+            val m = Regex("""(https?://(?:www\.)?(?:twitter|x)\.com/[A-Za-z0-9_]+/status/\d+)""").find(u)
+            if (m != null) u = m.groupValues[1]
         }
         return u
     }
@@ -126,18 +244,17 @@ class YtDlpPlugin : Plugin() {
         req.addOption("--no-playlist")
         req.addOption("--windows-filenames")
         req.addOption("--no-mtime")
-        req.addOption("--retries", "3")
-        req.addOption("--fragment-retries", "3")
-        req.addOption("--extractor-retries", "2")
+        req.addOption("--retries", "5")
+        req.addOption("--fragment-retries", "5")
+        req.addOption("--extractor-retries", "3")
         req.addOption("--socket-timeout", "10")
+        req.addOption("--force-ipv4") // Fixes initial 5-10s hang on networks with broken IPv6
         req.addOption("-N", "4") // Multi-threaded 4 concurrent fragment streams for fast download
         req.addOption("-o", "${outDir.absolutePath}/%(title).150B.%(ext)s")
         
-        // Modern browser User-Agent so Instagram and YouTube do not reject requests as bots
-        req.addOption("--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
-        if (url.contains("instagram.com")) {
-            req.addOption("--referer", "https://www.instagram.com/")
-        }
+        // Let yt-dlp use its default user-agent and extractor logic
+        // Forcing a custom user-agent breaks YouTube's Android API client (causing throttling) 
+        // and breaks Instagram's extractor.
         if (cookies) req.addOption("--cookies", cookiesFile().absolutePath)
 
         when (format) {
@@ -252,6 +369,13 @@ class YtDlpPlugin : Plugin() {
         } catch (e: Exception) {
             call.reject("Could not open media player: ${e.message}")
         }
+    }
+
+    @PluginMethod
+    fun getInitialShareUrl(call: PluginCall) {
+        val u = initialSharedUrl ?: ""
+        initialSharedUrl = null
+        call.resolve(JSObject().put("url", u))
     }
 
     // ---------------------------------------------------------------- helpers

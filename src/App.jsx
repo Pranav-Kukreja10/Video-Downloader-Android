@@ -55,12 +55,14 @@ export default function App() {
   const [version, setVersion] = useState("");
   const [hasCookies, setHasCookies] = useState(false);
   
-  // In-flight download job
-  const [job, setJob] = useState(null); // { id, progress }
+  // In-flight download jobs
+  const [activeJobs, setActiveJobs] = useState([]); // [{ id, url, progress, title, thumbnail }]
+  const [pendingMedia, setPendingMedia] = useState(null); // { url, title, thumbnail, duration, uploader, loading }
   
   // Persistent completed download banner (Never auto-hides after 1s)
   const [downloadResult, setDownloadResult] = useState(null); // { id, name, uri, format, quality }
   const [errorMessage, setErrorMessage] = useState("");
+  const [realtimeError, setRealtimeError] = useState("");
   
   const [note, setNote] = useState("");
   const [showSettings, setShowSettings] = useState(false);
@@ -75,7 +77,6 @@ export default function App() {
   });
 
   const fileRef = useRef(null);
-  const busy = Boolean(job && job.progress < 100);
 
   // Apply Theme & Theme-Color Meta
   useEffect(() => {
@@ -92,18 +93,41 @@ export default function App() {
     localStorage.setItem("aura_vault_items", JSON.stringify(vaultItems));
   }, [vaultItems]);
 
-  // YtDlp listeners
+  // YtDlp listeners & Share Intent handling
   useEffect(() => {
     const subs = [
       YtDlp.addListener("ready", () => setReady(true)),
       YtDlp.addListener("progress", (e) => {
-        setJob((j) => (j && j.id === e.id ? { ...j, progress: e.progress } : j));
+        setActiveJobs((jobs) => 
+          jobs.map(j => j.id === e.id ? { ...j, progress: e.progress } : j)
+        );
+      }),
+      YtDlp.addListener("realtime_error", (e) => {
+        setRealtimeError(e.error);
       }),
       YtDlp.addListener("fatal", (e) => {
         setErrorMessage(e.error || "Engine failed to initialize.");
-        setJob(null);
+      }),
+      YtDlp.addListener("shared_url", (e) => {
+        if (e?.url) {
+          setUrl(cleanMediaUrl(e.url));
+          setActiveTab("studio");
+        }
       }),
     ];
+
+    // Check if the app was opened via Android "Share" intent
+    if (YtDlp.getInitialShareUrl) {
+      YtDlp.getInitialShareUrl()
+        .then((res) => {
+          if (res?.url) {
+            setUrl(cleanMediaUrl(res.url));
+            setActiveTab("studio");
+          }
+        })
+        .catch(() => {});
+    }
+
     return () => subs.forEach((s) => s.then((h) => h.remove()));
   }, []);
 
@@ -130,6 +154,26 @@ export default function App() {
     };
   }, [formatOpen, qualityOpen]);
 
+  // Debounced Info Fetch
+  useEffect(() => {
+    const cleaned = cleanMediaUrl(url);
+    if (!cleaned || !/^https?:\/\/.+/.test(cleaned)) {
+      setPendingMedia(null);
+      return;
+    }
+    let active = true;
+    const t = setTimeout(async () => {
+      setPendingMedia({ loading: true, url: cleaned });
+      try {
+        const info = await YtDlp.getInfo({ url: cleaned });
+        if (active) setPendingMedia({ ...info, url: cleaned, loading: false });
+      } catch (err) {
+        if (active) setPendingMedia(null);
+      }
+    }, 600);
+    return () => { active = false; clearTimeout(t); };
+  }, [url]);
+
   const toggleTheme = () => {
     setTheme((prev) => (prev === "dark" ? "light" : "dark"));
   };
@@ -151,10 +195,29 @@ export default function App() {
 
   const cleanMediaUrl = (input) => {
     let u = (input || "").trim();
+    
+    // Extract the first http/https URL from the text (useful for share intents with extra text)
+    const urlMatch = u.match(/(https?:\/\/[^\s]+)/);
+    if (urlMatch) {
+      u = urlMatch[1];
+    }
+
     if (u.includes("instagram.com")) {
       u = u.replace("/share/reel/", "/reel/").replace("/share/p/", "/p/");
-      const m = u.match(/(https?:\/\/(?:www\.)?instagram\.com\/(?:reel|reels|p|tv)\/[A-Za-z0-9_-]+)/);
+      const m = u.match(/(https?:\/\/(?:www\.|m\.)?instagram\.com\/(?:reel|reels|p|tv)\/[A-Za-z0-9_-]+)/);
       if (m) u = m[1] + "/";
+    } else if (u.includes("youtu.be/")) {
+      const m = u.match(/(https?:\/\/youtu\.be\/[A-Za-z0-9_-]+)/);
+      if (m) u = m[1];
+    } else if (u.includes("youtube.com/watch")) {
+      const m = u.match(/(https?:\/\/(?:www\.|m\.)?youtube\.com\/watch\?v=[A-Za-z0-9_-]+)/);
+      if (m) u = m[1];
+    } else if (u.includes("youtube.com/shorts/")) {
+      const m = u.match(/(https?:\/\/(?:www\.|m\.)?youtube\.com\/shorts\/[A-Za-z0-9_-]+)/);
+      if (m) u = m[1];
+    } else if (u.includes("twitter.com/") || u.includes("x.com/")) {
+      const m = u.match(/(https?:\/\/(?:www\.)?(?:twitter|x)\.com\/[A-Za-z0-9_]+\/status\/\d+)/);
+      if (m) u = m[1];
     }
     return u;
   };
@@ -172,18 +235,24 @@ export default function App() {
     const targetUrl = cleanMediaUrl(url);
     if (!targetUrl) return;
     const id = String(Date.now());
+    
+    const meta = pendingMedia && !pendingMedia.loading ? pendingMedia : { title: "Media Link", thumbnail: "" };
+    
+    setActiveJobs(prev => [{ id, progress: 0, url: targetUrl, title: meta.title, thumbnail: meta.thumbnail }, ...prev]);
+    setUrl("");
+    setPendingMedia(null);
     setErrorMessage("");
-    setJob({ id, progress: 0 });
 
     try {
       const r = await YtDlp.download({ id, url: targetUrl, format, quality });
       
       const finishedItem = {
         id,
-        name: r.name || "media_file",
+        name: r.name || meta.title || "media_file",
         uri: r.uri || "",
         format,
         quality,
+        thumbnail: meta.thumbnail,
         date: new Date().toLocaleDateString(undefined, {
           month: "short",
           day: "numeric",
@@ -192,24 +261,18 @@ export default function App() {
         }),
       };
 
-      // Persistent success result banner (stays until user dismisses or starts new)
       setDownloadResult(finishedItem);
-      setJob(null);
-
-      // Save to Vault history
+      setActiveJobs(prev => prev.filter(j => j.id !== id));
       setVaultItems((prev) => [finishedItem, ...prev.slice(0, 49)]);
-      setUrl("");
     } catch (e) {
-      setJob(null);
+      setActiveJobs(prev => prev.filter(j => j.id !== id));
       setErrorMessage(e?.message || "Download failed. Please check the URL.");
     }
   };
 
-  const cancelDownload = async () => {
-    if (job?.id) {
-      await YtDlp.cancel({ id: job.id });
-      setJob(null);
-    }
+  const cancelDownload = async (jobId) => {
+    await YtDlp.cancel({ id: jobId });
+    setActiveJobs(prev => prev.filter(j => j.id !== jobId));
   };
 
   // Play media in default device video player
@@ -348,7 +411,7 @@ export default function App() {
                     setUrl(e.target.value);
                     if (errorMessage) setErrorMessage("");
                   }}
-                  disabled={busy}
+                  disabled={false}
                 />
                 <div className="input-actions">
                   {url ? (
@@ -371,6 +434,33 @@ export default function App() {
               </div>
             </div>
 
+            {/* Pre-flight Info Preview */}
+            {pendingMedia && (
+              <div style={{ display: "flex", gap: "12px", background: "var(--pill-bg)", padding: "10px", borderRadius: "var(--radius-md)", border: "1px solid var(--pill-border)" }}>
+                {pendingMedia.loading ? (
+                  <div style={{ width: "100%", textAlign: "center", color: "var(--text-muted)", fontSize: "0.8rem", padding: "12px 0" }}>
+                    Fetching stream metadata...
+                  </div>
+                ) : (
+                  <>
+                    <div style={{ width: "60px", height: "60px", borderRadius: "8px", overflow: "hidden", background: "var(--bg-card)", flexShrink: 0 }}>
+                      {pendingMedia.thumbnail ? (
+                        <img src={pendingMedia.thumbnail} alt="thumb" style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+                      ) : (
+                        <div style={{ width: "100%", height: "100%", display: "flex", alignItems: "center", justifyContent: "center", color: "var(--text-muted)" }}>
+                          <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
+                        </div>
+                      )}
+                    </div>
+                    <div style={{ display: "flex", flexDirection: "column", justifyContent: "center", minWidth: 0 }}>
+                      <div style={{ fontSize: "0.85rem", fontWeight: 700, color: "var(--text-primary)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{pendingMedia.title}</div>
+                      <div style={{ fontSize: "0.75rem", color: "var(--text-muted)", marginTop: "2px" }}>{pendingMedia.uploader} • {pendingMedia.duration}</div>
+                    </div>
+                  </>
+                )}
+              </div>
+            )}
+
             {/* Custom Format Dropdown */}
             <div className="dropdown-group">
               <label className="input-label">Output Format</label>
@@ -381,7 +471,6 @@ export default function App() {
                   setFormatOpen(!formatOpen);
                   setQualityOpen(false);
                 }}
-                disabled={busy}
               >
                 <div className="dropdown-selected">
                   <div className="format-icon-badge">
@@ -455,7 +544,6 @@ export default function App() {
                   setQualityOpen(!qualityOpen);
                   setFormatOpen(false);
                 }}
-                disabled={busy}
               >
                 <div className="dropdown-selected">
                   <div className="format-icon-badge">
@@ -506,7 +594,7 @@ export default function App() {
             <button
               className="download-action-btn"
               onClick={startDownload}
-              disabled={!ready || busy || !url.trim()}
+              disabled={!ready || !url.trim() || (pendingMedia && pendingMedia.loading)}
               type="button"
             >
               <div className="btn-shine" />
@@ -515,13 +603,13 @@ export default function App() {
                 <polyline points="7 10 12 15 17 10" />
                 <line x1="12" y1="15" x2="12" y2="3" />
               </svg>
-              <span>{!ready ? "Starting Engine…" : busy ? "Downloading…" : "Download"}</span>
+              <span>{!ready ? "Starting Engine…" : "Download"}</span>
             </button>
           </div>
 
-          {/* Active Download Progress Card */}
-          {busy && (
-            <div className="progress-card">
+          {/* Active Download Progress Cards */}
+          {activeJobs.map((job) => (
+            <div key={job.id} className="progress-card">
               <div className="progress-header">
                 <div className="progress-title-row">
                   <div className="spin-icon">
@@ -536,8 +624,8 @@ export default function App() {
                       <line x1="16.24" y1="7.76" x2="19.07" y2="4.93" />
                     </svg>
                   </div>
-                  <span className="progress-text">
-                    {job.progress === 0 ? "Connecting & Resolving…" : "Downloading Media…"}
+                  <span className="progress-text" style={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", maxWidth: "160px" }}>
+                    {job.progress === 0 ? "Starting…" : job.title || "Downloading Media…"}
                   </span>
                 </div>
                 <span className="progress-pct">{job.progress}%</span>
@@ -551,12 +639,12 @@ export default function App() {
                 <span className="progress-sub">
                   {job.progress === 0 ? "Analyzing stream link" : `${job.progress}% completed`}
                 </span>
-                <button className="cancel-btn" onClick={cancelDownload} type="button">
+                <button className="cancel-btn" onClick={() => cancelDownload(job.id)} type="button">
                   Cancel
                 </button>
               </div>
             </div>
-          )}
+          ))}
 
           {/* Persistent Download Success Banner (Fixed: Does NOT disappear after 1 second!) */}
           {downloadResult && (
@@ -609,15 +697,33 @@ export default function App() {
             </div>
           )}
 
-          {/* Error Banner */}
-          {errorMessage && (
-            <div className="error-banner">
-              <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                <circle cx="12" cy="12" r="10" />
-                <line x1="12" y1="8" x2="12" y2="12" />
-                <line x1="12" y1="16" x2="12.01" y2="16" />
-              </svg>
-              <span>{errorMessage}</span>
+          {/* Error Modal (Real-time and Fatal errors) */}
+          {(errorMessage || realtimeError) && (
+            <div className="modal-backdrop" onClick={() => { setErrorMessage(""); setRealtimeError(""); }} style={{ zIndex: 9999 }}>
+              <div className="settings-sheet" onClick={(e) => e.stopPropagation()}>
+                <div className="sheet-handle" />
+                <div className="sheet-header">
+                  <h3 className="sheet-title" style={{ color: "var(--red)", display: "flex", alignItems: "center", gap: "8px" }}>
+                    <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                      <circle cx="12" cy="12" r="10" />
+                      <line x1="12" y1="8" x2="12" y2="12" />
+                      <line x1="12" y1="16" x2="12.01" y2="16" />
+                    </svg>
+                    Download Error
+                  </h3>
+                </div>
+                <div className="sheet-section" style={{ padding: "16px", fontSize: "14px", lineHeight: "1.5", color: "var(--text-sec)", wordBreak: "break-word" }}>
+                  {errorMessage || realtimeError}
+                </div>
+                <button 
+                  className="download-action-btn" 
+                  onClick={() => { setErrorMessage(""); setRealtimeError(""); }} 
+                  style={{ width: "calc(100% - 32px)", margin: "0 16px 24px", background: "var(--bg-sec)", color: "var(--text)" }}
+                  type="button"
+                >
+                  Dismiss
+                </button>
+              </div>
             </div>
           )}
         </main>
@@ -659,8 +765,10 @@ export default function App() {
               {vaultItems.map((item) => (
                 <div key={item.id} className="vault-item-card">
                   <div className="vault-item-left">
-                    <div className="vault-item-icon">
-                      {item.format === "audio" ? (
+                    <div className="vault-item-icon" style={item.thumbnail ? { padding: 0, overflow: "hidden", background: "transparent", border: "none" } : {}}>
+                      {item.thumbnail ? (
+                        <img src={item.thumbnail} alt="thumb" style={{ width: "100%", height: "100%", objectFit: "cover", borderRadius: "10px" }} />
+                      ) : item.format === "audio" ? (
                         <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                           <path d="M9 18V5l12-2v13" />
                           <circle cx="6" cy="18" r="3" />
@@ -739,7 +847,7 @@ export default function App() {
                   <div className="setting-label">yt-dlp Core</div>
                   <div className="setting-sub">{version ? `v${version}` : "Bundled On-Device"}</div>
                 </div>
-                <button className="sheet-btn" onClick={updateEngine} disabled={!ready || busy}>
+                <button className="sheet-btn" onClick={updateEngine} disabled={!ready}>
                   Update Core
                 </button>
               </div>
@@ -750,11 +858,11 @@ export default function App() {
                   <div className="setting-sub">{hasCookies ? "Active session loaded" : "No cookies imported"}</div>
                 </div>
                 <div style={{ display: "flex", gap: "6px" }}>
-                  <button className="sheet-btn" onClick={() => fileRef.current?.click()} disabled={busy}>
+                  <button className="sheet-btn" onClick={() => fileRef.current?.click()}>
                     Import
                   </button>
                   {hasCookies && (
-                    <button className="sheet-btn" onClick={removeCookies} disabled={busy}>
+                    <button className="sheet-btn" onClick={removeCookies}>
                       Clear
                     </button>
                   )}
